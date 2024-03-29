@@ -19,3 +19,10 @@ OLEDディスプレイのSDAを16番ピンに、SCLを17番ピンに接続して
 
 CO2センサ（MHZ-19）は、RXを4番ピンにTXを5番ピンに接続して、UART1番を使用しています。  
 センサー側のTXとマイコン側のRX、センサー側のRXとマイコン側のTXを接続してください。
+
+## ライブラリ
+
+以下のライブラリを使用しています。
+
+- [https://pypi.org/project/micropython-ssd1306](https://pypi.org/project/micropython-ssd1306)  
+- [https://github.com/overflo23/MH-Z19_MicroPython](https://github.com/overflo23/MH-Z19_MicroPython)
