@@ -11,6 +11,7 @@ from env import WIFI_SSID, WIFI_PASSWORD, API_URL
 class DisplayManager:
     def __init__(self, display):
         self.display = display
+        self.is_show = True
         self.lines = ['', '', '', '']   # 固定の4行を初期化
         self.x = [0, 0, 0, 0]           # 各行のx座標
         self.y = [4, 20, 36, 52]        # 各行のy座標
@@ -22,6 +23,11 @@ class DisplayManager:
 
     def show(self):
         self.display.fill(0)
+        
+        if not self.is_show:
+            self.display.show()
+            return
+        
         # 横線を描画
         self.display.hline(0, 16, 128, True)
         self.display.hline(0, 32, 128, True)
@@ -32,6 +38,13 @@ class DisplayManager:
             self.display.text(text, self.x[i], self.y[i], True)
 
         self.display.show()
+        
+    def set_is_show(self, is_show):
+        self.is_show = is_show
+        self.show()
+        
+    def get_is_show(self):
+        return self.is_show
 
 # Wifiに接続
 def connect_wlan():
@@ -114,14 +127,27 @@ OLED_ADDR      = const(0x3c)    # OLEDのI2Cアドレス
 OLED_SCL       = const(17)      # OLEDのSCLピン
 OLED_SDA       = const(16)      # OLEDのSDAピン
 SEND_EVERY_SEC = const(300)     # 何秒間隔でデータを送信するか
+EXIT_TRY       = const(2)       # プログラム終了までの猶予(0までカウントされる)
+is_sleep = False
 
 # LEDを有効化
 pin = Pin('LED', Pin.OUT)
+
+# GPIO 21を入力として設定し、内蔵のプルダウン抵抗を無効にする
+button = Pin(21, Pin.IN, Pin.PULL_UP)
+# 割り込みハンドラ関数 - ディスプレイの表示・非表示を切り替え
+def handle_interrupt(pin):
+    if is_sleep:
+        return
+    print('pressing button..')
+    dm.set_is_show(not dm.get_is_show())
+button.irq(trigger=Pin.IRQ_RISING, handler=handle_interrupt)
 
 # MH-Z19センサーを有効化
 sensor = mhz19.mhz19(UART_ID)
 
 # OLEDを有効化
+is_display = True
 i2c = I2C(I2C_ID, sda=Pin(OLED_SDA), scl=Pin(OLED_SCL), freq=I2C_FREQ)
 display = ssd1306.SSD1306_I2C(OLED_WIDTH, OLED_HEIGHT, i2c, addr=OLED_ADDR)
 dm = DisplayManager(display)
@@ -156,17 +182,51 @@ except Exception as e:
 # loop forever
 dm.set_line(3, 'Booted!!', 4)
 dm.show()
+exit_count = 0
 while True:
     sleep(0.8)
+    
+    # ボタンの長押しでスリープ及び解除
+    if rp2.bootsel_button():
+        # スリープ状態の場合、スリープを解除
+        if is_sleep:
+            if exit_count > EXIT_TRY:
+                exit_count = 0
+                is_sleep = False
+                dm.set_line(1, 'Waking up...', 4)
+                dm.set_is_show(True)
+            else :
+                exit_count += 1
+                pin.toggle()
+                continue
+            
+        # 非スリープ状態の場合はスリープに以降
+        else:
+            if exit_count > EXIT_TRY:
+                dm.set_is_show(False)
+                pin.off()
+                is_sleep = True
+                continue
+            else :
+                #  スリープまでのカウントダウン
+                dm.set_is_show(True)
+                dm.set_line(1, str(EXIT_TRY - exit_count) + ' to sleep', 4)
+                exit_count += 1
 
-    # 現在時刻を取得
-    hour, minute, second = get_jst()
-    str_jst = '{:02d}:{:02d}:{:02d}'.format(hour, minute, second)
+    # ボタンが押されていない場合、カウントをリセット
+    else:
+        exit_count = 0
+        if is_sleep:
+            continue
+    
+        # 現在時刻を取得
+        hour, minute, second = get_jst()
+        str_jst = '{:02d}:{:02d}:{:02d}'.format(hour, minute, second)
+        dm.set_line(1, 'Now : ' + str_jst, 4)
     
     # CO2センサーからデータを取得
     try :
         sensor.get_data()
-        dm.set_line(1, 'Now : ' + str_jst, 4)
         dm.set_line(2, 'Temp: ' + str(sensor.temp) + 'C', 4)
     except Exception as e:
         dm.set_line(1, 'CO2/temp sensor', 4)
@@ -183,4 +243,7 @@ while True:
     dm.show()
     
     # LED点滅
-    pin.toggle()
+    if dm.get_is_show():
+        pin.toggle()
+    else :
+        pin.on()
