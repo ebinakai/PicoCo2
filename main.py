@@ -139,7 +139,6 @@ button = Pin(21, Pin.IN, Pin.PULL_UP)
 def handle_interrupt(pin):
     if is_sleep:
         return
-    print('pressing button..')
     dm.set_is_show(not dm.get_is_show())
 button.irq(trigger=Pin.IRQ_RISING, handler=handle_interrupt)
 
@@ -236,6 +235,7 @@ while True:
     if (minute * 60 + second) % SEND_EVERY_SEC == 0:
         response = send_post()
         dm.set_line(3, response, 4)
+        print(response)
     else :
         dm.set_line(3, 'CO2 : ' + str(sensor.ppm) + 'ppm', 4)
 

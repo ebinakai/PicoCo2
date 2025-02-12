@@ -1,0 +1,3 @@
+WIFI_SSID=''
+WIFI_PASSWORD=''
+API_URL='' # Web APIのURL
