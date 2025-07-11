@@ -1,53 +1,86 @@
 from machine import Pin, I2C, reset
-from utime import sleep, localtime, mktime
+from utime import sleep, localtime, mktime, ticks_ms, ticks_diff
 import network
 import ntptime
 import ssd1306
 import mhz19
 import urequests
+import rp2
 from env import WIFI_SSID, WIFI_PASSWORD, API_URL
+
+# MicroPythonではenumモジュールが利用できないため、クラス定数として定義
+class DisplayMode:
+    SLEEP = 1
+    SETUP = 2
+    RUNNING = 3
 
 # OLEDに表示
 class DisplayManager:
-    def __init__(self, display):
+    def __init__(self, display: ssd1306.SSD1306_I2C_Extended):
         self.display = display
         self.is_show = True
-        self.lines = ['', '', '', '']   # 固定の4行を初期化
-        self.x = [0, 0, 0, 0]           # 各行のx座標
-        self.y = [4, 20, 36, 52]        # 各行のy座標
-
-    def set_line(self, line_number, text, x):
+        self.status = DisplayMode.SETUP
+        self.line_objects = [{'text': '', 'x': 0, 'scale': 1} for _ in range(4)]  # オブジェクトの配列
+        self.lines = [''] * 4      # 固定の4行を初期化
+        self.x = [0] * 4           # 各行のx座標
+        self.y4 = [4, 20, 36, 52]  # 各行のy座標
+        self.y3 = [4, 25, 50]      # 3行目までのy座標
+        self.scales = [1, 1, 1, 1] # 各行のスケール（拡大倍率）
+        
+    def set_line(self, line_number: int, text: str, x: int, scale: int=1):
         if 0 <= line_number < 4:
+            # オブジェクトの配列で管理
+            self.line_objects[line_number] = {
+                'text': text,
+                'x': x,
+                'scale': scale
+            }
+            # 0 <= line_number < 4 の範囲であることを確認
             self.lines[line_number] = text
             self.x[line_number] = x
+            self.scales[line_number] = scale
 
     def show(self):
+        # ディスプレイをクリア
         self.display.fill(0)
         
-        if not self.is_show:
+        if self.status == DisplayMode.SLEEP:
             self.display.show()
             return
         
-        # 横線を描画
-        self.display.hline(0, 16, 128, True)
-        self.display.hline(0, 32, 128, True)
-        self.display.hline(0, 48, 128, True)
-        
-        # テキストを表示
-        for i, text in enumerate(self.lines):
-            self.display.text(text, self.x[i], self.y[i], True)
+        if self.status == DisplayMode.SETUP:
+            # 横線を描画
+            self.display.hline(0, 16, 128, True)
+            self.display.hline(0, 32, 128, True)
+            self.display.hline(0, 48, 128, True)
+            
+            # テキストを表示
+            for i in range(4):
+                self.display.text(self.line_objects[i]['text'],
+                                  self.line_objects[i]['x'], self.y4[i], True, 1)
+                
+        elif self.status == DisplayMode.RUNNING:
+            # 横線を描画
+            self.display.hline(0, 21, 128, True)
+            self.display.hline(0, 42, 128, True)
+            
+            # テキストを表示
+            for i in range(3):
+                self.display.text(self.line_objects[i]['text'],
+                                  self.line_objects[i]['x'], self.y3[i], True, 2)
 
         self.display.show()
         
-    def set_is_show(self, is_show):
-        self.is_show = is_show
+    def set_status(self, status: DisplayMode):
+        self.status = status
         self.show()
-        
-    def get_is_show(self):
-        return self.is_show
+    
+    def get_status(self):
+        return self.status
 
 # Wifiに接続
-def connect_wlan():
+def connect_wlan(dm: DisplayManager):
+    
     wlan = network.WLAN(network.STA_IF)
     wlan.active(True)
     wlan.connect(WIFI_SSID, WIFI_PASSWORD)
@@ -65,13 +98,12 @@ def connect_wlan():
         dm.show()
         
         counter += 1
-        pin.toggle()
         sleep(0.05)
         
     return wlan
 
 # NTPサーバーから時刻を取得
-def sync_ntp(retry=3):
+def sync_ntp(dm: DisplayManager, retry=3):
     attempt = 0
     while attempt < retry:
         try:
@@ -87,11 +119,14 @@ def sync_ntp(retry=3):
     raise Exception('Failed to sync clock')
 
 # APIにデータを送信
-def send_post():
+def send_post(ppm=None, temp=None):
+    if ppm is None or temp is None:
+        return 'Invalid sensor data.'
+    
     # データをJSON形式で送信
     data = [
-        {'name': 'co2', 'value': sensor.ppm},
-        {'name': 'temp', 'value': sensor.temp}
+        {'name': 'co2', 'value': ppm},
+        {'name': 'temp', 'value': temp}
     ]
     
     try:
@@ -117,6 +152,59 @@ def get_jst():
     hour, minute, second = jst_time[3:6]      # 時、分、秒のみを取得
     return hour, minute, second
 
+def setup():
+    # LEDを有効化
+    led = Pin('LED', Pin.OUT)
+
+    # GPIO 21を入力として設定し、内蔵のプルダウン抵抗を無効にする
+    button = Pin(21, Pin.IN, Pin.PULL_UP)
+    # 割り込みハンドラ関数 - ディスプレイの表示・非表示を切り替え
+    def handle_interrupt(pin):
+        dm.set_status(DisplayMode.RUNNING if dm.get_status() == DisplayMode.SLEEP else DisplayMode.SLEEP)
+        sleep(0.1)  # ボタンのチャタリング防止のために少し待機
+    button.irq(trigger=Pin.IRQ_RISING, handler=handle_interrupt)
+
+    # MH-Z19センサーを有効化
+    sensor = mhz19.mhz19(UART_ID)
+    
+    # OLEDを有効化
+    i2c = I2C(I2C_ID, sda=Pin(OLED_SDA), scl=Pin(OLED_SCL), freq=I2C_FREQ)
+    display_ssd1306 = ssd1306.SSD1306_I2C_Extended(OLED_WIDTH, OLED_HEIGHT, i2c, addr=OLED_ADDR)
+    dm = DisplayManager(display_ssd1306)
+    
+    try :
+        # Wifiを有効化
+        wlan = connect_wlan(dm)
+        
+        print('WLAN connected:', wlan.isconnected())
+
+        # IPアドレスを取得
+        print('Network config:', wlan.ifconfig())
+        ipaddress = wlan.ifconfig()[0]
+
+        # 接続状態とIPアドレスを表示
+        dm.set_line(0, ipaddress, 8)
+        dm.set_line(1, 'Connected!', 4)
+        dm.show()
+
+        # NTPサーバーから時刻を取得し、RTCに設定
+        sync_ntp(dm)
+
+        # NTP時刻取得完了メッセージ
+        dm.set_line(2, 'Clock synced!', 4)
+        dm.set_line(3, 'Booting up...', 4)
+        dm.show()
+        
+    except Exception as e:
+        dm.set_line(2, 'Error occurred,', 4)
+        dm.set_line(3, 'Restarting...', 4)
+        sleep(1)
+        reset()
+        
+    dm.set_line(3, 'Booted!!', 4)
+    dm.show()
+    return led, sensor, dm
+
 # 定数
 UART_ID        = const(1)       # UART ID
 I2C_ID         = const(0)       # I2C ID
@@ -126,124 +214,79 @@ OLED_HEIGHT    = const(64)      # OLEDの縦ドット数
 OLED_ADDR      = const(0x3c)    # OLEDのI2Cアドレス
 OLED_SCL       = const(17)      # OLEDのSCLピン
 OLED_SDA       = const(16)      # OLEDのSDAピン
-SEND_EVERY_SEC = const(300)     # 何秒間隔でデータを送信するか
+SEND_INTERVAL  = const(300)     # 何秒間隔でデータを送信するか
 EXIT_TRY       = const(2)       # プログラム終了までの猶予(0までカウントされる)
-is_sleep = False
+PRESS_TIME     = const(3900)    # ボタンを押してからスリープまでの時間(ミリ秒)
+FLASH_TIME     = const(1000)    # LEDの点滅時間(ミリ秒)
 
-# LEDを有効化
-pin = Pin('LED', Pin.OUT)
-
-# GPIO 21を入力として設定し、内蔵のプルダウン抵抗を無効にする
-button = Pin(21, Pin.IN, Pin.PULL_UP)
-# 割り込みハンドラ関数 - ディスプレイの表示・非表示を切り替え
-def handle_interrupt(pin):
-    if is_sleep:
-        return
-    dm.set_is_show(not dm.get_is_show())
-button.irq(trigger=Pin.IRQ_RISING, handler=handle_interrupt)
-
-# MH-Z19センサーを有効化
-sensor = mhz19.mhz19(UART_ID)
-
-# OLEDを有効化
-is_display = True
 i2c = I2C(I2C_ID, sda=Pin(OLED_SDA), scl=Pin(OLED_SCL), freq=I2C_FREQ)
-display = ssd1306.SSD1306_I2C(OLED_WIDTH, OLED_HEIGHT, i2c, addr=OLED_ADDR)
-dm = DisplayManager(display)
+display_ssd1306 = ssd1306.SSD1306_I2C_Extended(OLED_WIDTH, OLED_HEIGHT, i2c, addr=OLED_ADDR)
+dm = DisplayManager(display_ssd1306)
 
-try :
-    # Wifiを有効化
-    wlan = connect_wlan()
+# 初期化
+led, sensor, dm = setup()
+start_press_time = 0
+start_led_time = 0
+status_bootsel = False
+status_before = dm.get_status()
 
-    # IPアドレスを取得
-    print('Network config:', wlan.ifconfig())
-    ipaddress = wlan.ifconfig()[0]
+# 少々待機してから開始
+sleep(1)
+dm.set_status(DisplayMode.RUNNING)
 
-    # 接続状態とIPアドレスを表示
-    dm.set_line(0, ipaddress, 8)
-    dm.set_line(1, 'Connected!', 4)
-    dm.show()
-
-    # NTPサーバーから時刻を取得し、RTCに設定
-    sync_ntp()
-
-    # NTP時刻取得完了メッセージ
-    dm.set_line(2, 'Clock synced!', 4)
-    dm.set_line(3, 'Booting up...', 4)
-    dm.show()
-    
-except Exception as e:
-    dm.set_line(2, 'Error occurred,', 4)
-    dm.set_line(3, 'Restarting...', 4)
-    sleep(1)
-    reset()
-
-# loop forever
-dm.set_line(3, 'Booted!!', 4)
-dm.show()
-exit_count = 0
 while True:
-    sleep(0.8)
-    
     # ボタンの長押しでスリープ及び解除
     if rp2.bootsel_button():
-        # スリープ状態の場合、スリープを解除
-        if is_sleep:
-            if exit_count > EXIT_TRY:
-                exit_count = 0
-                is_sleep = False
-                dm.set_line(1, 'Waking up...', 4)
-                dm.set_is_show(True)
-            else :
-                exit_count += 1
-                pin.toggle()
-                continue
+        if not status_bootsel:
+            start_press_time = ticks_ms()
+            before_status = dm.get_status()
+        
+        if before_status == dm.get_status():
+            if ticks_diff(ticks_ms(), start_press_time) > PRESS_TIME:
+                # スリープ状態の場合、スリープを解除
+                if dm.get_status() == DisplayMode.SLEEP:
+                    dm.set_line(0, 'Waking up...', 4)
+                    dm.set_status(DisplayMode.RUNNING)
             
-        # 非スリープ状態の場合はスリープに以降
-        else:
-            if exit_count > EXIT_TRY:
-                dm.set_is_show(False)
-                pin.off()
-                is_sleep = True
-                continue
-            else :
-                #  スリープまでのカウントダウン
-                dm.set_is_show(True)
-                dm.set_line(1, str(EXIT_TRY - exit_count) + ' to sleep', 4)
-                exit_count += 1
+                # 非スリープ状態の場合はスリープに以降
+                else:
+                    dm.set_status(DisplayMode.SLEEP)
+            elif dm.get_status() == DisplayMode.RUNNING:
+                countdown_ms = PRESS_TIME - ticks_diff(ticks_ms(), start_press_time) # ミリ秒
+                dm.set_line(0, str(countdown_ms // 1000) + ' to sleep', 4)
+        status_bootsel = True
 
-    # ボタンが押されていない場合、カウントをリセット
+    # ボタンが押されていない場合
     else:
-        exit_count = 0
-        if is_sleep:
-            continue
-    
         # 現在時刻を取得
         hour, minute, second = get_jst()
         str_jst = '{:02d}:{:02d}:{:02d}'.format(hour, minute, second)
-        dm.set_line(1, 'Now : ' + str_jst, 4)
+        dm.set_line(0, str_jst, 0)
+        status_bootsel = False
     
     # CO2センサーからデータを取得
     try :
         sensor.get_data()
-        dm.set_line(2, 'Temp: ' + str(sensor.temp) + 'C', 4)
+        dm.set_line(1, str(sensor.temp) + 'C', 16)
     except Exception as e:
-        dm.set_line(1, 'CO2/temp sensor', 4)
-        dm.set_line(2, 'read fail..', 4)
+        dm.set_line(0, 'Sensor', 4)
+        dm.set_line(1, 'Failed..', 4)
 
     # 指定された頻度でデータベースに値を送信
-    if (minute * 60 + second) % SEND_EVERY_SEC == 0:
-        response = send_post()
-        dm.set_line(3, response, 4)
+    if (minute * 60 + second) % SEND_INTERVAL == 0:
+        response = send_post(sensor.ppm, sensor.temp)
+        dm.set_line(2, response, 4)
         print(response)
     else :
-        dm.set_line(3, 'CO2 : ' + str(sensor.ppm) + 'ppm', 4)
+        dm.set_line(2, str(sensor.ppm) + 'ppm', 0)
 
     # 設定した表示を反映
     dm.show()
     
     # LED点滅
-    if dm.get_is_show():
-        pin.toggle()
+    if dm.get_status() == DisplayMode.RUNNING:
+        if ticks_diff(ticks_ms(), start_led_time) > FLASH_TIME:
+            start_led_time = ticks_ms()
+            led.toggle()
     else :
-        pin.on()
+        led.off()

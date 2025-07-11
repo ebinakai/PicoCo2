@@ -3,7 +3,6 @@
 from micropython import const
 import framebuf
 
-
 # register definitions
 SET_CONTRAST = const(0x81)
 SET_ENTIRE_ON = const(0xA4)
@@ -153,3 +152,62 @@ class SSD1306_SPI(SSD1306):
         self.cs(0)
         self.spi.write(buf)
         self.cs(1)
+
+
+class SSD1306_I2C_Extended(SSD1306_I2C):
+    """SSD1306_I2Cを継承し、拡大可能なテキスト描画機能を追加したクラス"""
+    
+    def text_scaled(self, text, x, y, color, scale=1):
+        """
+        拡大可能なテキスト描画メソッド
+        
+        Args:
+            text: 描画するテキスト
+            x: X座標
+            y: Y座標
+            color: 色（0または1）
+            scale: 拡大倍率（1, 2, 3...）
+        """
+        if scale == 1:
+            # 通常サイズの場合は親クラスの標準のtextメソッドを使用
+            super().text(text, x, y, color)
+            return
+        
+        # 一時的なバッファに標準サイズで描画
+        temp_width = len(text) * 8  # 1文字8ピクセル幅
+        temp_height = 8  # 標準フォント高さ
+        temp_buffer = bytearray((temp_width * temp_height) // 8 + 1)
+        
+        temp_fb = framebuf.FrameBuffer(temp_buffer, temp_width, temp_height, framebuf.MONO_VLSB)
+        
+        # 一時バッファに標準サイズでテキストを描画
+        temp_fb.fill(0)
+        temp_fb.text(text, 0, 0, 1)
+        
+        # 拡大して元のディスプレイに描画
+        for char_y in range(temp_height):
+            for char_x in range(temp_width):
+                # 一時バッファからピクセルを取得
+                pixel = temp_fb.pixel(char_x, char_y)
+                if pixel:
+                    # 拡大して描画
+                    for sy in range(scale):
+                        for sx in range(scale):
+                            draw_x = x + char_x * scale + sx
+                            draw_y = y + char_y * scale + sy
+                            # 画面範囲内の場合のみ描画
+                            if 0 <= draw_x < self.width and 0 <= draw_y < self.height:
+                                self.pixel(draw_x, draw_y, color)
+    
+    def text(self, text, x, y, color, scale=1):
+        """
+        textメソッドをオーバーライドしてスケール機能を追加
+        
+        Args:
+            text: 描画するテキスト
+            x: X座標
+            y: Y座標
+            color: 色（0または1）
+            scale: 拡大倍率（デフォルト1）
+        """
+        self.text_scaled(text, x, y, color, scale)
